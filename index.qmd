@@ -1,0 +1,17 @@
+---
+title: "Template"
+author: "Cameron Ritchie"
+format:
+  html:
+    toc: true
+    toc_float: true
+    embed-resources: true
+editor: visual
+execute: 
+  warning: false
+  message: false
+---
+
+## About Me
+
+[Lab 7](lab7.html)
