@@ -12,6 +12,12 @@ execute:
   message: false
 ---
 
-## About Me
+# About Me
+
+Hi, my name is Cameron Ritchie.
+
+![Cameron Ritchie](images/ritchie.jpg)
+
+# My Labs
 
 [Lab 7](lab7.html)
