@@ -1,5 +1,5 @@
 ---
-title: "Template"
+title: "Lab 13"
 author: "Cameron Ritchie"
 format:
   html:
@@ -12,14 +12,3 @@ execute:
   message: false
 ---
 
-# About Me
-
-Hi, my name is Cameron Ritchie.
-
-![Cameron Ritchie](images/ritchie.jpg)
-
-# My Labs
-
-[Lab 7](lab7.html)
-
-[Lab 13](lab13.html)
