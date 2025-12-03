@@ -12,3 +12,253 @@ execute:
   message: false
 ---
 
+```{r}
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(viridis)
+library(janitor)
+library(plotly)
+library(respirometry)
+library(permute)
+library(vegan)
+```
+
+```{r}
+library(readr)
+NEON_soilMAGs_soilChem_jeff <- read_csv("NEON_soilMAGs_soilChem_jeff.csv")
+```
+
+```{r, eval = FALSE}
+View(NEON_soilMAGs_soilChem_jeff)
+```
+
+# Data import, cleaning, and basic checks
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(viridis)
+library(janitor)
+library(plotly)
+library(respirometry)
+library(permute)
+library(vegan)
+
+# 1) Load data
+dat <- readr::read_csv("NEON_soilMAGs_soilChem_jeff.csv") %>%
+  janitor::clean_names()
+
+# 2) Parse dates
+dat <- dat %>%
+  mutate(
+    date = suppressWarnings(ymd(date)),
+    date_added = suppressWarnings(ymd(date_added))
+  )
+
+# 3) Ensure essential taxonomy fields
+dat <- dat %>%
+  mutate(
+    genus = coalesce(genus, "Unclassified"),
+    phylum = coalesce(phylum, "Unclassified"),
+    domain = coalesce(domain, "Unclassified")
+  )
+
+# 4) Environmental variables (extend if your full file has more)
+env_cols <- c("soil_moisture", "soil_temp", "soil_in_waterp_h", "soil_in_ca_clp_h",
+              "decimal_latitude", "decimal_longitude", "elevation", "site_id")
+
+# 5) Check replicate count
+n_samples <- dat %>% distinct(genomics_sample_id) %>% nrow()
+if (n_samples < 3) {
+  stop("Need ≥3 distinct genomics_sample_id values for co-occurrence inference.")
+}
+
+# 6) Quick peek
+glimpse(dat)
+```
+
+Explanation: Cleaning column names prevents join/selection mistakes. We parse dates for potential stratified analyses later. Co-occurrence needs multiple samples; the check avoids spurious inference when there’s no across-sample variation.
+
+# Build genus abundance and apply sensible filters
+
+```{r}
+# Use gene_count as abundance proxy
+abund_df <- dat %>%
+  select(genomics_sample_id, genus, gene_count) %>%
+  group_by(genus, genomics_sample_id) %>%
+  summarize(abundance = sum(gene_count, na.rm = TRUE), .groups = "drop")
+
+# Wide matrix: genera x samples
+abund_wide <- abund_df %>%
+  pivot_wider(names_from = genomics_sample_id, values_from = abundance, values_fill = 0)
+
+genus_names <- abund_wide$genus
+abund_mat <- abund_wide %>% select(-genus) %>% as.matrix()
+rownames(abund_mat) <- genus_names
+
+# Prevalence filter: keep genera present in ≥10% of samples or at least 3
+min_prev <- max(3, ceiling(0.10 * ncol(abund_mat)))
+keep <- rowSums(abund_mat > 0) >= min_prev
+abund_mat <- abund_mat[keep, , drop = FALSE]
+
+if (nrow(abund_mat) < 5) {
+  stop("Too few genera after prevalence filtering. Lower min_prev or adjust proxy.")
+}
+
+# Hellinger transform for community data
+abund_hell <- vegan::decostand(abund_mat, method = "hellinger")
+```
+
+Explanation: Summing gene count per genus creates a consistent abundance table. Prevalence filtering removes ultra-rare genera that inflate false correlations. Hellinger transformation stabilizes variance for relative community data before computing associations.
+
+# Co-occurrence network with Spearman correlations and BH-adjusted significance
+
+```{r}
+# Spearman correlations across samples
+cor_mat <- cor(t(abund_hell), method = "spearman")
+
+# Permutation-based p-values via sample label shuffling
+set.seed(123)
+B <- 999
+genus_by_sample <- t(abund_hell)  # samples x genera
+g <- ncol(genus_by_sample)
+p_mat <- matrix(NA_real_, nrow = g, ncol = g,
+                dimnames = list(colnames(genus_by_sample), colnames(genus_by_sample)))
+for (i in 1:(g - 1)) {
+  for (j in (i + 1):g) {
+    rho_obs <- suppressWarnings(cor(genus_by_sample[, i], genus_by_sample[, j], method = "spearman"))
+    rho_perm <- numeric(B)
+    for (b in 1:B) {
+      idx <- permute::shuffle(n = nrow(genus_by_sample))
+      rho_perm[b] <- suppressWarnings(cor(genus_by_sample[idx, i], genus_by_sample[, j], method = "spearman"))
+    }
+    p_val <- mean(abs(rho_perm) >= abs(rho_obs))
+    p_mat[i, j] <- p_val
+    p_mat[j, i] <- p_val
+  }
+}
+diag(p_mat) <- 0
+
+# Multiple test correction (Benjamini–Hochberg)
+padj_vec <- p.adjust(p_mat[upper.tri(p_mat)], method = "BH")
+padj_mat <- matrix(NA_real_, nrow = g, ncol = g, dimnames = dimnames(p_mat))
+padj_mat[upper.tri(padj_mat)] <- padj_vec
+padj_mat[lower.tri(padj_mat)] <- t(padj_mat)[lower.tri(padj_mat)]
+diag(padj_mat) <- 0
+
+# Edge list thresholding
+alpha <- 0.1
+rho_min <- 0.3
+edges_idx <- which((padj_mat < alpha) & (abs(cor_mat) >= rho_min), arr.ind = TRUE)
+
+edge_df <- tibble(
+  genus_a = rownames(cor_mat)[edges_idx[, 1]],
+  genus_b = colnames(cor_mat)[edges_idx[, 2]],
+  rho = cor_mat[edges_idx],
+  padj = padj_mat[edges_idx],
+  sign = if_else(rho >= 0, "positive", "negative")
+) %>%
+  filter(genus_a < genus_b) %>%
+  arrange(desc(rho))
+
+DT::datatable(edge_df, options = list(pageLength = 10))
+```
+
+```{r}
+summary(as.vector(cor_mat))
+range(p_mat, na.rm = TRUE)
+```
+
+Explanation: Spearman correlation captures monotonic co-variation robust to non-normality. We estimate significance by permuting sample labels, then control FDR with BH. The network only keeps edges with sufficient effect size (|rho| ≥ 0.3) and padj < 0.1, balancing discovery and reliability.
+
+# Module detection with correlation distance and eigengenes
+
+```{r}
+# Cluster genera using 1 - |rho| distance
+dist_mat <- as.dist(1 - abs(cor_mat))
+hc <- hclust(dist_mat, method = "average")
+
+# Cut tree to form modules (tune cut height)
+cut_h <- 0.6
+module_id <- cutree(hc, h = cut_h)
+module_df <- tibble(genus = names(module_id), module = paste0("M", module_id))
+
+# Module eigengenes (mean of z-scored abundances within module)
+abund_scaled <- t(scale(t(abund_mat), center = TRUE, scale = TRUE))  # genera x samples
+eigengene_df <- module_df %>%
+  group_by(module) %>%
+  summarize(eigengene = list(colMeans(abund_scaled[genus, , drop = FALSE], na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(sample = list(colnames(abund_scaled))) %>%
+  unnest(cols = c(eigengene, sample)) %>%
+  rename(module_eigengene = eigengene)
+
+# Environmental table per sample
+env_df <- dat %>%
+  distinct(genomics_sample_id, .keep_all = TRUE) %>%
+  select(genomics_sample_id, any_of(env_cols)) %>%
+  janitor::clean_names()
+
+# Join modules to environment
+mod_env <- eigengene_df %>%
+  rename(genomics_sample_id = sample) %>%
+  left_join(env_df, by = "genomics_sample_id")
+
+# Correlate module eigengenes with environmental variables
+env_vars <- env_df %>%
+  select(-genomics_sample_id) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+mod_env_cor <- purrr::map_df(env_vars, function(v) {
+  mod_env %>%
+    group_by(module) %>%
+    summarize(
+      spearman_rho = suppressWarnings(
+        cor(module_eigengene, .data[[v]], method = "spearman", use = "complete.obs")
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(variable = v)
+}) %>%
+  select(module, variable, spearman_rho) %>%
+  arrange(module, desc(abs(spearman_rho)))
+
+DT::datatable(mod_env_cor, options = list(pageLength = 10))
+```
+
+Explanation: We form modules by clustering taxa that have high absolute correlation, capturing putative ecological guilds. Module eigengenes summarize each module’s abundance pattern. Correlating eigengenes with environment highlights which gradients (e.g., pH, moisture) best explain module behavior.
+
+# Visual summaries
+
+```{r}
+# Focus on genera involved in significant edges
+sig_genus <- unique(c(edge_df$genus_a, edge_df$genus_b))
+cor_sig <- cor_mat[sig_genus, sig_genus, drop = FALSE]
+
+# Correlation heatmap
+plotly::plot_ly(
+  x = colnames(cor_sig),
+  y = rownames(cor_sig),
+  z = cor_sig,
+  type = "heatmap",
+  colors = viridis::viridis(100)
+) %>%
+  layout(title = "Genus co-occurrence (Spearman rho)")
+
+# Module vs pH example (uses in-water pH if present)
+if ("soil_in_waterp_h" %in% names(mod_env)) {
+  ggplot(mod_env, aes(x = soil_in_waterp_h, y = module_eigengene, color = module)) +
+    geom_point(alpha = 0.7) +
+    geom_smooth(method = "loess", se = FALSE) +
+    scale_color_viridis_d() +
+    theme_minimal() +
+    labs(title = "Module eigengenes vs soil in water pH",
+         x = "Soil in water pH",
+         y = "Module eigengene")
+}
+```
+
+Explanation: Heatmaps help screen for cohesive taxon blocks. Scatter + smooths show how module abundance responds to a gradient (non-parametric LOESS avoids assuming linearity).
